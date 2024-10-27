@@ -7,7 +7,20 @@
 
 using namespace nvcuda;
 
+/**
+ * @brief OFFSET宏，
+ * row：矩阵中的行索引。
+ * col：矩阵中的列索引。
+ * ld：矩阵的行步幅（leading dimension），即每行在内存中占用的元素数量。
+ * 这样，通过行列和ld，获得在内存里的索引...
+ */
 #define OFFSET(row, col, ld) ((row) * (ld) + (col))
+
+/**
+ * @brief 将给定的指针类型转换为 float4 类型，并返回其第一个元素
+ * 理解为，一次读取4个浮点数
+ * float4 某种预定义的结构，里面只是有四个浮点数
+ */
 #define FLOAT4(pointer) (reinterpret_cast<float4*>(&(pointer))[0])
 
 typedef enum{
@@ -18,6 +31,16 @@ typedef enum{
     HGEMMAlignedV5
 } F16F16GemmTCAlgo_t;
 
+/**
+ * @brief 
+ * 
+ * @param a half类型，从<cuda_fp16.h>引入
+ * @param b 
+ * @param c 
+ * @param M 常见的尺寸之类
+ * @param N 
+ * @param K 
+ */
 void cpuF16F16Gemm(half *a, half *b, half *c, int M, int N, int K) {
 
     for (int m = 0; m < M; m++) {
@@ -31,29 +54,69 @@ void cpuF16F16Gemm(half *a, half *b, half *c, int M, int N, int K) {
     }
 }
 
+/**
+ * @brief 
+ * link到`doc/gemm优化（一）`的代码实现
+ * @param a M x K 矩阵
+ * @param b K x N 矩阵
+ * @param c 结果，M x N
+ * @param M 256，512,...
+ * @param N 
+ * @param K 
+ * @param blockDim(256) 
+ * @param gridDim(BX, BY)
+        const int BM = 128, BN = 256;
+        int BX = (N + BN - 1) / BN;
+        int BY = (M + BM - 1) / BM;
+        dim3 gridDim(BX, BY);
+        myHGEMMAlignedV1<<<gridDim, blockDim>>>(a, b, c, M, N, K);
+ */
 __global__ void myHGEMMAlignedV1(
     half * __restrict__ a, half * __restrict__ b, half * __restrict__ c,
     const int M, const int N, const int K) {
 
+    // global memory到shared memory的分块
+    // 为什么参数硬编码
+
+    // shared memory s_a BM x BK = 128 x 32
+    // shared memory s_b BK x BN = 32 x 256
+    // 为什么BM!=BN
     const int BM = 128;
     const int BN = 256;
     const int BK = 32;
 
+    //shared memory到register的分块
     int bx = blockIdx.x;
     int by = blockIdx.y;
     int tid = threadIdx.x;
     int wid = tid >> 5;
 
+    //用来对齐的
     const int APAD = 8;
     const int BPAD = 8;
 
+    // 在共享内存上储开辟分块数据区
     __shared__ half s_a[BM][BK + APAD];
     __shared__ half s_b[BK][BN + BPAD];
 
+    //wmma：Warp Matrix Multiply-Accumulate，就是post里说的FFMA指令
+    /**
+     * @brief  定义了一个WMMA片段用于（声明？）矩阵A。
+     *   wmma::matrix_a：指示片段用于矩阵A。
+     *   16, 16, 16：表示矩阵的行数、列数和每个片段的大小。
+     *   half：表示数据类型为16位浮点数。
+     *   wmma::row_major：指定内存布局为行优先（row-major）。
+     *   frag_a[2][4]：定义了一个二维数组，包含2个行和4个列的片段，用于存储数据。
+     *   WHY 2 x 4
+     */
     wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> frag_a[2][4];
     wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> frag_b[2][4];
+    // wmma::accumulator：指示片段用于累加器C
+    // 没有指定储存顺序之类
     wmma::fragment<wmma::accumulator, 16, 16, 16, half> frag_c[4][4];
 
+    // frag_c set 0
+    // 字面含义
     #pragma unroll
     for (int i = 0; i < 4; i++) {
         #pragma unroll
@@ -62,7 +125,21 @@ __global__ void myHGEMMAlignedV1(
         }
     }
 
+    // tid 上面获得的thread id,从block获得，这里从调用看，是0~255
+    // TODO 这id什么意思，后面有什么用，有点看不懂...
+    /**
+     * @brief 加载矩阵A的行索引
+     * 使用位运算提高性能
+     * 保证somehow向下取整
+     * 256(threadIdx) /2 => 128 个不同的index
+     */
     int load_a_smem_m = (tid >> 2) << 1;
+
+    /**
+     * @brief 加载矩阵A的列索引
+     * 用mask盖住最后两个bit
+     * 256 => 32 
+     */
     int load_a_smem_k = (tid &  3) << 3;
     int load_b_smem_k = (tid >> 5) << 2;
     int load_b_smem_n = (tid & 31) << 3;
@@ -76,19 +153,40 @@ __global__ void myHGEMMAlignedV1(
     int comp_c_frag_m = wid &  1;
     int comp_c_frag_n = wid >> 1;
 
+    // K / BK => 有多少个分块
+    // bk是分块尺寸，BK是分块数？
+    // 虚拟: for each thread
+    //         for eack share memory block
+    // 相当于
     for (int bk = 0; bk < K / BK; bk++) {
+
+        // shared memory s_a BM x BK = 128 x 32 half
+        // shared memory s_b BK x BN = 32 x 256 half
+        // 这里加载两个，但一共256thread，相当于加载了512次？
+        //操作不同，应该和BM!=BN 每个块的尺寸不同有关，这里不明先保留 TODO 
         FLOAT4(s_a[load_a_smem_m    ][load_a_smem_k]) = FLOAT4(a[load_a_gmem_addr        ]);
         FLOAT4(s_a[load_a_smem_m + 1][load_a_smem_k]) = FLOAT4(a[load_a_gmem_addr +     K]);
+
+
+
         FLOAT4(s_b[load_b_smem_k    ][load_b_smem_n]) = FLOAT4(b[load_b_gmem_addr        ]);
         FLOAT4(s_b[load_b_smem_k + 1][load_b_smem_n]) = FLOAT4(b[load_b_gmem_addr +     N]);
         FLOAT4(s_b[load_b_smem_k + 2][load_b_smem_n]) = FLOAT4(b[load_b_gmem_addr + 2 * N]);
         FLOAT4(s_b[load_b_smem_k + 3][load_b_smem_n]) = FLOAT4(b[load_b_gmem_addr + 3 * N]);
 
+        // step 全局内存里的参数
         load_a_gmem_addr += BK;
         load_b_gmem_addr += BK * N;
 
         __syncthreads();
 
+        /**
+        * @brief load_matrix_sync 是 CUDA 中用于高效加载矩阵数据的函数，
+        * 尤其在使用 WMMA（Warp Matrix Multiply-Accumulate）时。
+        * 它通常用于在共享内存或全局内存中加载矩阵，以便进行矩阵乘法等操作。
+        * 
+        * load shared memory to frag
+        */
         wmma::load_matrix_sync(frag_a[0][0], &s_a[comp_c_frag_m * 64     ][ 0], BK + APAD);
         wmma::load_matrix_sync(frag_a[0][1], &s_a[comp_c_frag_m * 64 + 16][ 0], BK + APAD);
         wmma::load_matrix_sync(frag_a[0][2], &s_a[comp_c_frag_m * 64 + 32][ 0], BK + APAD);
@@ -107,10 +205,16 @@ __global__ void myHGEMMAlignedV1(
         wmma::load_matrix_sync(frag_b[1][2], &s_b[16][comp_c_frag_n * 64 + 32], BN + BPAD);
         wmma::load_matrix_sync(frag_b[1][3], &s_b[16][comp_c_frag_n * 64 + 48], BN + BPAD);
 
+        /** wmma::mma_sync 
+         * @brief Tensor Core 矩阵乘加速器API
+         * 总共尺寸=4x4x2x4x4=512
+         */
         #pragma unroll
         for (int i = 0; i < 4; i++) {
             #pragma unroll
             for (int j = 0; j < 4; j++) {
+                // frag里面每一个是不是4x4的矩阵“片段”，而不是纯粹数值，从上面的load `+ 16`可以看出
+                // mul and add接口
                 wmma::mma_sync(frag_c[i][j], frag_a[0][i], frag_b[0][j], frag_c[i][j]);
                 wmma::mma_sync(frag_c[i][j], frag_a[1][i], frag_b[1][j], frag_c[i][j]);
             }
@@ -119,6 +223,7 @@ __global__ void myHGEMMAlignedV1(
         __syncthreads();
     }
 
+    // write back to c
     int store_c_gmem_m = by * BM + comp_c_frag_m * 64;
     int store_c_gmem_n = bx * BN + comp_c_frag_n * 64;
     int store_c_gmem_addr = OFFSET(store_c_gmem_m, store_c_gmem_n, N);
